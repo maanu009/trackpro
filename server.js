@@ -20,9 +20,13 @@ app.use(express.static(path.join(__dirname))); // Serve index.html
 
 // Connect to MongoDB
 mongoose.set('strictQuery', false);
-mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/trackpro')
+mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/trackpro', {
+    serverSelectionTimeoutMS: 30000,
+    family: 4
+})
     .then(() => console.log('MongoDB Connected'))
     .catch(err => console.error('MongoDB Connection Error:', err));
+
 
 // Routes
 app.use('/api/auth', authRoutes);
