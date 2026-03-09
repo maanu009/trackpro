@@ -12,6 +12,34 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- Firebase SDK -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+    import { getFirestore, collection, addDoc, getDocs, updateDoc, doc, deleteDoc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+    import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+
+    // TODO: Replace this with your actual Firebase configuration object
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+      projectId: "YOUR_PROJECT_ID",
+      storageBucket: "YOUR_PROJECT_ID.appspot.com",
+      messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+      appId: "YOUR_APP_ID"
+    };
+
+    // Initialize Firebase
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const auth = getAuth(app);
+
+    // Make available globally
+    window.db = db;
+    window.auth = auth;
+    window.firebaseCollections = { collection, addDoc, getDocs, updateDoc, doc, deleteDoc, getDoc, setDoc };
+    window.firebaseAuthAPI = { signInWithEmailAndPassword, onAuthStateChanged, signOut };
+  </script>
   <style>
     /* ===== CSS VARIABLES ===== */
     :root {
@@ -1976,42 +2004,72 @@
   <script>
     /* ===== DATA LAYER (API) ===== */
     const API = {
-      base: '/api',
+      base: '/api', // Left for legacy compatibility checks in code
       token: localStorage.getItem('tp_token') || '',
       role: localStorage.getItem('tp_role') || '',
       username: localStorage.getItem('tp_user') || '',
       athletes: [], events: [], results: [], heats: {}, chestCount: 0,
       registrationOpen: true, manualRegistrationOpen: true, registrationCloseTime: null,
 
-      headers() { return { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.token}` }; },
+      headers() { return {}; }, // Not needed for fb
 
       async loadAll() {
+        if (!window.db) {
+          console.warn("Firebase not initialized yet");
+          return;
+        }
+
         try {
-          const t = new Date().getTime();
-          const [aRes, eRes, rRes, sRes] = await Promise.all([
-            fetch(this.base + '/athletes?t=' + t), fetch(this.base + '/events?t=' + t), fetch(this.base + '/results?t=' + t), fetch(this.base + '/settings?t=' + t)
-          ]);
-          if (aRes.ok) {
-            const rawAthletes = await aRes.json();
-            this.athletes = rawAthletes.map(a => ({
+          // 1. Load Athletes
+          const athletesSnap = await window.firebaseCollections.getDocs(window.firebaseCollections.collection(window.db, "athletes"));
+          this.athletes = [];
+          athletesSnap.forEach((doc) => {
+            const a = doc.data();
+            this.athletes.push({
               ...a,
+              id: doc.id,
               chest: a.chestNumber || a.admissionNumber,
               team: a.department,
-              id: a._id
-            }));
-          }
-          if (eRes.ok) this.events = await eRes.json();
-          if (rRes.ok) this.results = await rRes.json();
-          if (sRes && sRes.ok) {
-            const settings = await sRes.json();
-            this.registrationOpen = settings.registrationOpen;
-            this.manualRegistrationOpen = settings.manualRegistrationOpen;
-            this.registrationCloseTime = settings.registrationCloseTime;
+              _id: doc.id
+            });
+          });
+
+          // 2. Load Events
+          const eventsSnap = await window.firebaseCollections.getDocs(window.firebaseCollections.collection(window.db, "events"));
+          this.events = [];
+          eventsSnap.forEach((doc) => {
+            this.events.push({ ...doc.data(), id: doc.id, _id: doc.id });
+          });
+
+          // 3. Load Results
+          const resultsSnap = await window.firebaseCollections.getDocs(window.firebaseCollections.collection(window.db, "results"));
+          this.results = [];
+          resultsSnap.forEach((doc) => {
+            this.results.push({ ...doc.data(), id: doc.id, _id: doc.id });
+          });
+
+          // 4. Load Settings
+          const settingsDocRef = window.firebaseCollections.doc(window.db, "settings", "global");
+          const settingsDoc = await window.firebaseCollections.getDoc(settingsDocRef);
+          if (settingsDoc.exists()) {
+            const settings = settingsDoc.data();
+            this.registrationOpen = settings.registrationOpen !== false;
+            this.manualRegistrationOpen = settings.manualRegistrationOpen !== false;
+            this.registrationCloseTime = settings.registrationCloseTime || null;
+          } else {
+            // Create default settings if it doesn't exist
+            await window.firebaseCollections.setDoc(settingsDocRef, {
+              registrationOpen: true,
+              manualRegistrationOpen: true,
+              registrationCloseTime: null
+            });
           }
 
           this.heats = JSON.parse(localStorage.getItem('tp_heats') || '{}');
           this.chestCount = parseInt(localStorage.getItem('tp_chest') || '0');
-        } catch (e) { console.error('API Sync Error', e); }
+        } catch (e) {
+          console.error('Firebase Sync Error', e);
+        }
       }
     };
 
@@ -2238,6 +2296,9 @@
     async function registerAthlete(e) {
       e.preventDefault();
       if (selectedEvents.length === 0) { toast('Please select at least one event!', 'warning'); return }
+
+      const newChestNumber = DB.nextChest();
+
       const athlete = {
         name: document.getElementById('regName').value.trim(),
         age: parseInt(document.getElementById('regAge').value),
@@ -2245,28 +2306,32 @@
         department: document.getElementById('regTeam').value.trim(),
         gender: document.getElementById('regGender').value,
         category: document.getElementById('regCategory').value,
-        events: [...selectedEvents]
+        events: [...selectedEvents],
+        chestNumber: newChestNumber.toString(),
+        createdAt: new Date().toISOString()
       };
 
       try {
-        const res = await fetch(API.base + '/athletes', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(athlete)
-        });
-        const data = await res.json();
+        const docRef = await window.firebaseCollections.addDoc(window.firebaseCollections.collection(window.db, "athletes"), athlete);
+        athlete.id = docRef.id;
+        athlete._id = docRef.id;
+        athlete.chest = athlete.chestNumber;
+        athlete.team = athlete.department;
 
-        if (res.ok) {
-          await API.loadAll();
-          // Find the newly saved athlete from the fresh API pull to show chest number
-          const newAth = API.athletes.find(a => (a._id || a.id) === data._id) || data;
-          showProfile(newAth);
-          document.getElementById('regForm').reset(); selectedEvents = []; renderEventChips();
-          toast('Athlete registered! Chest #' + newAth.chest, 'success');
-        } else {
-          toast(data.message || 'Registration failed', 'error');
-        }
+        // Optimistically update UI without wait for round trip reload
+        API.athletes.push(athlete);
+
+        showProfile(athlete);
+        document.getElementById('regForm').reset();
+        selectedEvents = [];
+        renderEventChips();
+        toast('Athlete registered! Chest #' + newChestNumber, 'success');
+
+        // Run full sync in background
+        API.loadAll();
       } catch (err) {
-        toast('Network Error', 'error');
+        console.error("Save Error:", err);
+        toast('Network Error: Could not save to database', 'error');
       }
     }
     function showProfile(a) {
@@ -2445,17 +2510,28 @@
     async function adminLogin() {
       const u = document.getElementById('adminUser').value, p = document.getElementById('adminPass').value;
       try {
-        const res = await fetch(API.base + '/auth/login', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: u, password: p })
-        });
-        const data = await res.json();
-        if (res.ok && data.user.role === 'admin') {
-          API.token = data.token; API.role = data.user.role; API.username = data.user.username;
-          localStorage.setItem('tp_token', API.token); localStorage.setItem('tp_role', API.role); localStorage.setItem('tp_user', API.username);
-          checkAuthUI(); refreshAdmin(); toast('Welcome, Admin!', 'success');
-        } else { toast(data.message || data.error || 'Invalid credentials!', 'error'); }
-      } catch (e) { toast('Login failed', 'error'); }
+        const userCredential = await window.firebaseAuthAPI.signInWithEmailAndPassword(window.auth, u, p);
+
+        // Signed in successfully
+        API.token = await userCredential.user.getIdToken();
+        API.role = 'admin'; // Hardcoding admin role for simplicity right now since this is the only auth wall
+        API.username = userCredential.user.email;
+
+        localStorage.setItem('tp_token', API.token);
+        localStorage.setItem('tp_role', API.role);
+        localStorage.setItem('tp_user', API.username);
+
+        checkAuthUI();
+        refreshAdmin();
+        toast('Welcome, Admin!', 'success');
+      } catch (e) {
+        console.error('Login error', e);
+        if (e.code === 'auth/invalid-credential') {
+          toast('Invalid credentials!', 'error');
+        } else {
+          toast('Login failed: ' + e.message, 'error');
+        }
+      }
     }
     function adminLogout() {
       localStorage.removeItem('tp_token'); localStorage.removeItem('tp_role'); localStorage.removeItem('tp_user');
@@ -2545,13 +2621,15 @@
     }
     async function confirmDelete(id) {
       try {
-        const res = await fetch(API.base + '/athletes/' + id, { method: 'DELETE', headers: API.headers() });
-        if (res.ok) {
-          await API.loadAll();
-          renderAdminAthletes(); toast('Athlete deleted', 'info');
-          closeModal();
-        }
-      } catch (e) { }
+        await window.firebaseCollections.deleteDoc(window.firebaseCollections.doc(window.db, "athletes", id));
+        API.athletes = API.athletes.filter(a => (a._id || a.id) !== id); // optimistic
+        renderAdminAthletes();
+        toast('Athlete deleted', 'info');
+        closeModal();
+      } catch (e) {
+        toast('Error deleting athlete', 'error');
+        console.error(e);
+      }
     }
 
     /* ===== ADMIN EVENTS ===== */
@@ -2593,14 +2671,14 @@
       const category = document.getElementById('newEventCategory').value;
       if (!name) return;
       try {
-        const res = await fetch(API.base + '/events', {
-          method: 'POST', headers: API.headers(), body: JSON.stringify({ name, type, category })
-        });
-        if (res.ok) {
-          await API.loadAll();
-          closeModal(); renderAdminEvents(); renderEventChips(); toast('Event added!', 'success');
-        } else { toast('Error adding event', 'error'); }
-      } catch (e) { toast('Network error', 'error'); }
+        const docRef = await window.firebaseCollections.addDoc(window.firebaseCollections.collection(window.db, "events"), { name, type, category });
+        API.events.push({ name, type, category, id: docRef.id, _id: docRef.id }); // optimistic
+        closeModal(); renderAdminEvents(); renderEventChips(); toast('Event added!', 'success');
+        API.loadAll();
+      } catch (e) {
+        toast('Error adding event', 'error');
+        console.error(e);
+      }
     }
     function editEvent(id) {
       const events = DB.getEvents(), ev = events.find(e => (e._id || e.id) === id); if (!ev) return;
@@ -2619,14 +2697,15 @@
       const type = document.getElementById('editEventType').value;
       const category = document.getElementById('editEventCategory').value;
       try {
-        const res = await fetch(API.base + '/events/' + id, {
-          method: 'PUT', headers: API.headers(), body: JSON.stringify({ name, type, category })
-        });
-        if (res.ok) {
-          await API.loadAll();
-          closeModal(); renderAdminEvents(); renderEventChips(); toast('Event updated!', 'success');
-        } else { toast('Failed to update event', 'error'); }
-      } catch (e) { toast('Network error', 'error'); }
+        await window.firebaseCollections.updateDoc(window.firebaseCollections.doc(window.db, "events", id), { name, type, category });
+        const idx = API.events.findIndex(e => (e._id || e.id) === id);
+        if (idx !== -1) { API.events[idx] = { ...API.events[idx], name, type, category }; } // optimistic
+        closeModal(); renderAdminEvents(); renderEventChips(); toast('Event updated!', 'success');
+        API.loadAll();
+      } catch (e) {
+        toast('Error updating event', 'error');
+        console.error(e);
+      }
     }
     function removeEvent(id) {
       const events = DB.getEvents(), ev = events.find(e => (e._id || e.id) === id); if (!ev) return;
@@ -2639,12 +2718,14 @@
     }
     async function confirmRemoveEvent(id) {
       try {
-        const res = await fetch(API.base + '/events/' + id, { method: 'DELETE', headers: API.headers() });
-        if (res.ok) {
-          await API.loadAll();
-          closeModal(); renderAdminEvents(); renderEventChips(); toast('Event removed', 'info');
-        } else { toast('Failed to remove event', 'error'); }
-      } catch (e) { toast('Network error', 'error'); }
+        await window.firebaseCollections.deleteDoc(window.firebaseCollections.doc(window.db, "events", id));
+        API.events = API.events.filter(e => (e._id || e.id) !== id); // optimistic
+        closeModal(); renderAdminEvents(); renderEventChips(); toast('Event removed', 'info');
+        API.loadAll();
+      } catch (e) {
+        toast('Error removing event', 'error');
+        console.error(e);
+      }
     }
     function viewEventParticipants(evName) {
       const athletes = DB.getAthletes().filter(a => a.events.includes(evName));
@@ -2847,10 +2928,11 @@
           const ath = API.athletes.find(a => (a._id || a.id) == id);
           if (ath) {
             results.push({
-              eventId: eventObj._id,
-              athleteId: ath._id,
+              eventId: { _id: eventObj._id, name: eventObj.name }, // Store mini ref instead of populated object for better DB structure
+              athleteId: { _id: ath._id, name: ath.name, admissionNumber: ath.admissionNumber, department: ath.department, gender: ath.gender },
               performance: perf,
-              position: (status === 'Completed' ? parseInt(rank.value) || 999 : 999)
+              position: (status === 'Completed' ? parseInt(rank.value) || 999 : 999),
+              eventName: eventObj.name
             });
           }
         }
@@ -2858,12 +2940,24 @@
       if (results.length === 0) { toast('Enter at least one result!', 'warning'); return; }
 
       try {
-        for (let r of results) {
-          await fetch(API.base + '/results', {
-            method: 'POST', headers: API.headers(), body: JSON.stringify(r)
-          });
+        // 1. Delete old results for this event first
+        const oldResults = API.results.filter(r => r.eventName === eventObj.name || (r.eventId && r.eventId._id === eventObj._id));
+        for (let old of oldResults) {
+          if (old._id || old.id) {
+            await window.firebaseCollections.deleteDoc(window.firebaseCollections.doc(window.db, "results", old._id || old.id));
+          }
         }
-        await API.loadAll();
+
+        // 2. Add new results
+        for (let r of results) {
+          const docRef = await window.firebaseCollections.addDoc(window.firebaseCollections.collection(window.db, "results"), r);
+          const r2 = { ...r };
+          r2.id = docRef.id;
+          r2._id = docRef.id;
+          API.results.push(r2); // optimistic
+        }
+
+        await API.loadAll(); // Revalidate
         renderPodium(evName);
         renderFullRankings(evName);
         renderResultsSummary();
@@ -2871,52 +2965,72 @@
         renderMedalCount();
         document.getElementById('resultEventSelect').value = evName;
         toast('✅ Results saved for ' + evName + '! (' + results.length + ' records)', 'success');
-      } catch (e) { toast('Error saving results', 'error'); }
+      } catch (e) {
+        toast('Error saving results', 'error');
+        console.error(e);
+      }
     }
 
-    function clearEventResults() {
+    async function clearEventResults() {
       const evName = document.getElementById('resultEventSelect').value;
       if (!evName) return;
       if (!confirm('Clear all results for ' + evName + '?')) return;
-      const allResults = DB.getResults(); delete allResults[evName]; DB.saveResults(allResults);
-      loadResults();
-      populateResultEvents();
-      document.getElementById('resultEventSelect').value = evName;
-      toast('Results cleared for ' + evName, 'info');
+
+      const eventObj = API.events.find(e => e.name === evName || e.name + ' - ' + e.category === evName);
+      if (!eventObj) return;
+
+      try {
+        const oldResults = API.results.filter(r => r.eventName === eventObj.name || (r.eventId && r.eventId._id === eventObj._id));
+        for (let old of oldResults) {
+          if (old._id || old.id) {
+            await window.firebaseCollections.deleteDoc(window.firebaseCollections.doc(window.db, "results", old._id || old.id));
+          }
+        }
+        await API.loadAll();
+        // Optimistic UI updates
+        loadResults();
+        populateResultEvents();
+        document.getElementById('resultEventSelect').value = evName;
+        toast('Results cleared for ' + evName, 'info');
+      } catch (e) {
+        toast('Error clearing results', 'error');
+      }
     }
 
     function renderPodium(evName) {
-      const allResults = DB.getResults();
-      const results = (allResults[evName] || []).filter(r => r.performance !== 'DNS' && r.performance !== 'DNF').sort((a, b) => a.rank - b.rank);
-      const athletes = DB.getAthletes(), pd = document.getElementById('podiumDisplay');
+      const rawResults = API.results.filter(r => r.eventName === evName || (r.eventId && r.eventId.name === evName));
+      const results = rawResults.filter(r => r.performance !== 'DNS' && r.performance !== 'DNF').sort((a, b) => (a.position - b.position) || (a.rank - b.rank));
+      const pd = document.getElementById('podiumDisplay');
       if (results.length < 1) { pd.innerHTML = '<div style="text-align:center;padding:30px;color:var(--text2)"><i class="fas fa-trophy" style="font-size:2rem;margin-bottom:8px;display:block;color:var(--glass3)"></i><p>Save results to see the podium</p></div>'; return }
       const top3 = results.slice(0, 3);
       const places = ['gold', 'silver', 'bronze'], icons = ['🥇', '🥈', '🥉'];
       // Visual order: Silver(1st place=idx1), Gold(0th=idx0), Bronze(2nd=idx2)
       const order = top3.length >= 2 ? [1, 0, 2].filter(i => i < top3.length) : [0];
       pd.innerHTML = '<div class="podium">' + order.map(i => {
-        const r = top3[i], a = athletes.find(x => x.id === r.athleteId);
+        const r = top3[i], a = r.athleteId || {};
         return '<div class="podium-place ' + places[i] + '">' +
           '<div class="rank">' + icons[i] + '</div>' +
           '<div class="p-name">' + (a ? a.name : 'Unknown') + '</div>' +
-          '<div style="font-size:.75rem;color:var(--text2)">' + (a ? a.team : '') + '</div>' +
+          '<div style="font-size:.75rem;color:var(--text2)">' + (a ? a.department : '') + '</div>' +
           '<div class="p-result">' + formatResult(r.performance) + '</div></div>';
       }).join('') + '</div>';
     }
 
     function renderFullRankings(evName) {
-      const allResults = DB.getResults(), results = (allResults[evName] || []).sort((a, b) => a.rank - b.rank);
-      const athletes = DB.getAthletes(), fd = document.getElementById('fullRankingsDisplay');
+      const rawResults = API.results.filter(r => r.eventName === evName || (r.eventId && r.eventId.name === evName));
+      const results = rawResults.sort((a, b) => (a.position - b.position) || (a.rank - b.rank));
+      const fd = document.getElementById('fullRankingsDisplay');
       if (results.length < 1) { fd.innerHTML = '<p style="color:var(--text2);text-align:center;padding:20px">No results to display</p>'; return }
       const medalIcons = { 1: '🥇', 2: '🥈', 3: '🥉' };
       const isTrack = isTrackEvent(evName);
       fd.innerHTML = '<div class="table-container"><table class="results-table"><thead><tr><th>Pos</th><th>Chest</th><th>Athlete</th><th>Dept</th><th>' + (isTrack ? 'Time' : 'Distance') + '</th><th>Category</th></tr></thead><tbody>' +
         results.map(r => {
-          const a = athletes.find(x => x.id === r.athleteId);
+          const a = r.athleteId || {};
           const isDidNot = r.performance === 'DNS' || r.performance === 'DNF';
-          const posDisplay = isDidNot ? '-' : (medalIcons[r.rank] || '<span style="color:var(--text2)">#' + r.rank + '</span>');
-          const rankClass = (!isDidNot && r.rank <= 3) ? 'rank-' + r.rank : '';
-          return '<tr class="' + rankClass + '"><td style="font-size:1.1rem">' + posDisplay + '</td><td><strong>' + (a ? a.chest : '?') + '</strong></td><td>' + (a ? a.name : 'Unknown') + '</td><td>' + (a ? a.team : '-') + '</td><td class="time-record">' + formatResult(r.performance) + (!isDidNot && r.rank === 1 ? ' <span class="record-badge best"><i class="fas fa-star"></i> Best</span>' : '') + '</td><td>' + (a ? a.category : '-') + '</td></tr>';
+          const rPos = r.position || r.rank || 999;
+          const posDisplay = isDidNot ? '-' : (medalIcons[rPos] || '<span style="color:var(--text2)">#' + rPos + '</span>');
+          const rankClass = (!isDidNot && rPos <= 3) ? 'rank-' + rPos : '';
+          return '<tr class="' + rankClass + '"><td style="font-size:1.1rem">' + posDisplay + '</td><td><strong>' + (a.admissionNumber || a.chest || '?') + '</strong></td><td>' + (a.name || 'Unknown') + '</td><td>' + (a.department || a.team || '-') + '</td><td class="time-record">' + formatResult(r.performance) + (!isDidNot && rPos === 1 ? ' <span class="record-badge best"><i class="fas fa-star"></i> Best</span>' : '') + '</td><td>' + (a.category || '-') + '</td></tr>';
         }).join('') +
         '</tbody></table></div>';
     }
@@ -3193,28 +3307,18 @@
       const closeTime = document.getElementById('adminRegCloseTime').value;
 
       try {
-        const res = await fetch(API.base + '/settings', {
-          method: 'POST',
-          headers: API.headers(),
-          body: JSON.stringify({
-            registrationOpen: openStatus,
-            registrationCloseTime: closeTime || null
-          })
+        await window.firebaseCollections.setDoc(window.firebaseCollections.doc(window.db, "settings", "global"), {
+          registrationOpen: openStatus,
+          manualRegistrationOpen: openStatus, // sync them for simplicity in UI
+          registrationCloseTime: closeTime || null
         });
-        const data = await res.json();
-        if (res.ok) {
-          toast('Settings saved successfully', 'success');
-          await API.loadAll();
-          checkRegistrationStatus();
-        } else if (res.status === 401) {
-          toast('Session expired. Please log in again.', 'warning');
-          adminLogout();
-          toggleLogin();
-        } else {
-          toast(data.message || 'Failed to save settings', 'error');
-        }
+
+        toast('Settings saved successfully', 'success');
+        await API.loadAll();
+        checkRegistrationStatus();
       } catch (err) {
-        toast('Network Error', 'error');
+        toast('Network Error: Could not save settings', 'error');
+        console.error(err);
       }
     }
 
@@ -3257,32 +3361,92 @@
     /* ===== INIT ===== */
     async function renderMedalCount() {
       try {
-        const res = await fetch(API.base + '/results/medal-count');
-        if (!res.ok) return;
-        const data = await res.json();
-        let html = '<div class="table-container"><table><tr><th>Rank</th><th>Department</th><th>🥇 Gold</th><th>🥈 Silver</th><th>🥉 Bronze</th><th>Total Pts</th></tr>';
-        data.forEach((d, i) => {
-          const pts = (d.gold * 5) + (d.silver * 3) + (d.bronze * 1);
-          html += `<tr class="${i === 0 ? 'gold-row' : ''}"><td>${i + 1}</td><td style="font-weight:bold">${d.department}</td><td>${d.gold}</td><td>${d.silver}</td><td>${d.bronze}</td><td style="color:var(--gold);font-weight:bold">${pts}</td></tr>`;
+        const pointsConfig = { 1: 5, 2: 3, 3: 1 };
+        const deptStats = {};
+
+        const validResults = API.results.filter(r =>
+          r.performance !== 'DNS' &&
+          r.performance !== 'DNF' &&
+          (r.position || r.rank) <= 3
+        );
+
+        validResults.forEach(r => {
+          const ath = r.athleteId || {};
+          const team = ath.department || ath.team;
+          const rank = r.position || r.rank;
+
+          if (team) {
+            if (!deptStats[team]) {
+              deptStats[team] = { department: team, gold: 0, silver: 0, bronze: 0 };
+            }
+            if (rank === 1) deptStats[team].gold++;
+            if (rank === 2) deptStats[team].silver++;
+            if (rank === 3) deptStats[team].bronze++;
+          }
         });
+
+        // Convert to array and sort by points
+        const data = Object.values(deptStats).sort((a, b) => {
+          const ptsA = (a.gold * 5) + (a.silver * 3) + (a.bronze * 1);
+          const ptsB = (b.gold * 5) + (b.silver * 3) + (b.bronze * 1);
+          if (ptsA !== ptsB) return ptsB - ptsA;
+          return b.gold - a.gold; // Tie breaker
+        });
+
+        let html = '<div class="table-container"><table><tr><th>Rank</th><th>Department</th><th>🥇 Gold</th><th>🥈 Silver</th><th>🥉 Bronze</th><th>Total Pts</th></tr>';
+        if (data.length === 0) {
+          html += '<tr><td colspan="6" style="text-align:center;color:var(--text2)">No medals awarded yet</td></tr>';
+        } else {
+          data.forEach((d, i) => {
+            const pts = (d.gold * 5) + (d.silver * 3) + (d.bronze * 1);
+            html += `<tr class="${i === 0 ? 'gold-row' : ''}"><td>${i + 1}</td><td style="font-weight:bold">${d.department}</td><td>${d.gold}</td><td>${d.silver}</td><td>${d.bronze}</td><td style="color:var(--gold);font-weight:bold">${pts}</td></tr>`;
+          });
+        }
         html += '</table></div>';
-        document.getElementById('deptPointTableContainer').innerHTML = html;
-      } catch (e) { console.error(e); }
+        const container = document.getElementById('deptPointTableContainer');
+        if (container) container.innerHTML = html;
+      } catch (e) { console.error("Error rendering medal count", e); }
     }
 
-    (async function initApp() {
-      try {
-        await API.loadAll();
+    (function initApp() {
+      // Setup auth listener before anything else
+      window.firebaseAuthAPI.onAuthStateChanged(window.auth, async (user) => {
+        if (user) {
+          API.token = await user.getIdToken();
+          API.role = 'admin'; // Hardcoded for simplicity
+          API.username = user.email;
+          localStorage.setItem('tp_token', API.token);
+          localStorage.setItem('tp_role', API.role);
+          localStorage.setItem('tp_user', API.username);
+        } else {
+          API.token = '';
+          API.role = '';
+          API.username = '';
+          localStorage.removeItem('tp_token');
+          localStorage.removeItem('tp_role');
+          localStorage.removeItem('tp_user');
+          if (document.getElementById('page-admin').classList.contains('active')) {
+            showPage('home');
+          }
+        }
         checkAuthUI();
-        checkRegistrationStatus();
-        await renderMedalCount();
-        renderPublicEvents();
-        renderEventChips();
-      } catch (e) {
-        console.error("Init Error:", e);
-      } finally {
-        setTimeout(() => { document.getElementById('loader').classList.add('hide') }, 500);
-      }
+      });
+
+      // Load data and setup UI sequence
+      setTimeout(async () => {
+        try {
+          await API.loadAll();
+          checkAuthUI();
+          checkRegistrationStatus();
+          await renderMedalCount();
+          renderPublicEvents();
+          renderEventChips();
+        } catch (e) {
+          console.error("Init Error:", e);
+        } finally {
+          setTimeout(() => { document.getElementById('loader').classList.add('hide') }, 500);
+        }
+      }, 0);
     })();
 
     window.addEventListener('DOMContentLoaded', () => {
