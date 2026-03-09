@@ -19,6 +19,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname))); // Serve index.html
 
 // Connect to MongoDB
+mongoose.set('strictQuery', false);
 mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/trackpro')
     .then(() => console.log('MongoDB Connected'))
     .catch(err => console.error('MongoDB Connection Error:', err));
